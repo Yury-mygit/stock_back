@@ -10,6 +10,8 @@ from app import config, db
 from app.logger import logger
 from app.proxy import router as proxy_router, close_client
 from app.portfolio_api import router as portfolio_router, fetch_and_store_rates
+from app.screener import router as screener_router
+from app.ratings_api import router as ratings_router
 
 
 scheduler = AsyncIOScheduler()
@@ -58,6 +60,8 @@ app.add_middleware(
 
 app.include_router(proxy_router)
 app.include_router(portfolio_router)
+app.include_router(screener_router)
+app.include_router(ratings_router)
 
 
 @app.get("/health")

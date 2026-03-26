@@ -1,277 +1,457 @@
 """
-API эндпоинты для работы с портфелем.
+API портфеля.
 
-GET  /portfolio            — список всех бумаг портфеля (с данными из bonds)
-POST /portfolio            — добавить бумагу в портфель
-PUT  /portfolio/{secid}    — обновить ручные поля (брокер, кол-во, рейтинг, сектор)
-DELETE /portfolio/{secid}  — удалить бумагу из портфеля
-
-POST /portfolio/{secid}/sync  — синхронизировать данные бумаги с MOEX ISS
-POST /portfolio/sync-all      — синхронизировать весь портфель
+POST /portfolio/add          — добавить инструмент в портфель
+DELETE /portfolio/{type}/{id} — удалить из портфеля
+GET  /portfolio              — список всех позиций
+POST /portfolio/sync/{secid} — обновить данные одной бумаги с MOEX
+POST /portfolio/sync-all     — обновить все бумаги портфеля
+GET  /rates                  — текущие курсы валют
 """
 from __future__ import annotations
 
+import re
 from datetime import date as dt_date
-from dataclasses import dataclass
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from app import config, db
+from app import db
 from app.logger import logger
-from app.proxy import get_client
 
-router = APIRouter(prefix="/portfolio", tags=["portfolio"])
+router = APIRouter(tags=["portfolio"])
 
+MOEX_BASE = "https://iss.moex.com/iss"
 
-# ── Pydantic-схемы запросов ────────────────────────────────────────────────
-
-class PortfolioItem(BaseModel):
-    secid:  str
-    broker: str = ""
-    qty:    int = 0
-    rating: str = ""
-    sector: str = ""
+# Определение типа инструмента по boardid
+BOARD_TO_TYPE = {
+    "TQCB": "bond", "TQOB": "bond", "TQOD": "bond",
+    "TQBR": "stock", "TQBS": "stock",
+    "TQTF": "fund",  "TQTE": "fund",
+}
 
 
-class PortfolioUpdate(BaseModel):
-    broker: str = ""
-    qty:    int = 0
-    rating: str = ""
-    sector: str = ""
+# ── Утилиты ────────────────────────────────────────────────────────────────
+
+def _get_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(base_url=MOEX_BASE, timeout=15)
+
+
+def _extract_emitent(name: str) -> str:
+    """Извлекает название эмитента из полного названия бумаги."""
+    if not name:
+        return name
+    patterns = [
+        r'\s+БО[\s\-]\S+', r'\s+БО$',
+        r'\s+\d{3}[РP][\-\s]\S+', r'\s+\d{3}[РP]$',
+        r'\d{3}[РP][\-\s]\S+',
+        r'\s+[Сс]ерии?\s+\S+', r'\s+[Пп]\d+$',
+    ]
+    s = re.sub(r'\s+\d{2}[./]\d{2}[./]\d{2,4}$', '', name).strip()
+    for pat in patterns:
+        m = re.search(pat, s, re.IGNORECASE)
+        if m:
+            s = s[:m.start()].strip()
+            break
+    return s
+
+
+def _get_rates_for_calc() -> dict:
+    rates = db.get_latest_exchange_rates() or {}
+    return {
+        "usd": rates.get("usd", 1.0),
+        "eur": rates.get("eur", 1.0),
+        "cny": rates.get("cny", 1.0),
+    }
+
+
+def _calc_cost(price: float | None, face_value: float | None,
+               nkd: float | None, currency: str | None,
+               qty: int, rates: dict) -> float | None:
+    """Рассчитывает стоимость позиции в рублях."""
+    if price is None or face_value is None:
+        return None
+    cur = (currency or "RUB").upper()
+    rate = rates.get(cur.lower(), 1.0) if cur != "RUB" else 1.0
+    bond_price = price / 100 * face_value * rate
+    nkd_rub    = (nkd or 0) * (rate if cur != "RUB" else 1.0)
+    return round((bond_price + nkd_rub) * qty, 2)
+
+
+# ── Получение данных с MOEX ────────────────────────────────────────────────
+
+async def _fetch_bond_data(secid: str) -> dict:
+    """Делает 2 запроса к MOEX ISS для облигации."""
+    async with _get_client() as client:
+        # 1. Description — статические поля
+        r1 = await client.get(f"/securities/{secid}.json",
+                              params={"iss.meta": "off", "iss.only": "description"})
+        r1.raise_for_status()
+        desc_data = r1.json()["description"]
+        dm = {row[0]: row[2] for row in desc_data["data"]}
+
+        boardid    = dm.get("BOARDID", "TQCB")
+        face_value = float(dm.get("FACEVALUE") or 1000)
+        face_unit  = dm.get("FACEUNIT", "SUR")
+        currency   = "RUB" if face_unit in ("SUR", "RUB") else face_unit
+
+        # 2. Котировки
+        market = "bonds"
+        r2 = await client.get(
+            f"/engines/stock/markets/{market}/boards/{boardid}/securities/{secid}.json",
+            params={
+                "iss.meta": "off",
+                "iss.only": "securities,marketdata",
+                "securities.columns": "SECID,SHORTNAME,PREVPRICE,ACCRUEDINT,YIELDATPREVWAPRICE",
+                "marketdata.columns": "SECID,LAST,OPEN",
+            }
+        )
+        r2.raise_for_status()
+        q = r2.json()
+
+        sec_row = next(iter(q["securities"]["data"]), None)
+        md_row  = next(iter(q["marketdata"]["data"]), None)
+
+        shortname = (sec_row[1] if sec_row else None) or dm.get("SHORTNAME") or secid
+        price     = (md_row[1] if md_row and md_row[1] else None) or \
+                    (sec_row[2] if sec_row else None)
+        open_p    = md_row[2] if md_row else None
+        nkd       = float(sec_row[3]) if sec_row and sec_row[3] else 0.0
+        yld       = float(sec_row[4]) if sec_row and sec_row[4] else None
+
+        is_amort  = 1 if dm.get("BOND_SUBTYPE") == "Амортизационная" else 0
+
+    # Определяем эмитента
+    # Если в bonds уже есть запись с emitent_id — сохраняем его, не пересоздаём
+    existing_bond = db.get_bond_by_secid(secid)
+    if existing_bond and existing_bond.get("emitent_id"):
+        emitent_id = existing_bond["emitent_id"]
+    else:
+        emitent_name = _extract_emitent(dm.get("NAME") or shortname)
+        emitent_id   = None
+        if emitent_name:
+            existing_emitent = db.get_emitent_by_name(emitent_name)
+            emitent_id = existing_emitent["id"] if existing_emitent else db.upsert_emitent(emitent_name)
+
+    return {
+        "secid":              secid,
+        "isin":               dm.get("ISIN", secid),
+        "emitent_id":         emitent_id,
+        "shortname":          shortname,
+        "boardid":            boardid,
+        "price":              float(price) if price else None,
+        "face_value":         face_value,
+        "cost":               None,  # заполнится после
+        "yield_value":        yld,
+        "days_to_redemption": int(dm.get("DAYSTOREDEMPTION") or 0),
+        "is_amort":           is_amort,
+        "buyback_date":       dm.get("BUYBACKDATE"),
+        "bond_subtype":       dm.get("BOND_SUBTYPE"),
+        "coupon_freq":        int(dm.get("COUPONFREQUENCY") or 0),
+        "coupon_pct":         float(dm.get("COUPONPERCENT") or 0) or None,
+        "coupon_value":       float(dm.get("COUPONVALUE") or 0) or None,
+        "nkd":                nkd,
+        "currency":           currency,
+        "is_qual":            int(dm.get("ISQUALIFIEDINVESTORS") or 0),
+        "matdate":            dm.get("MATDATE"),
+        "list_level":         int(dm.get("LISTLEVEL") or 0) or None,
+        "open_price":         float(open_p) if open_p else None,
+    }
+
+
+async def _fetch_stock_data(secid: str) -> dict:
+    """Получает данные акции с MOEX."""
+    async with _get_client() as client:
+        r1 = await client.get(f"/securities/{secid}.json",
+                              params={"iss.meta": "off", "iss.only": "description"})
+        r1.raise_for_status()
+        desc_data = r1.json()["description"]
+        dm = {row[0]: row[2] for row in desc_data["data"]}
+
+        boardid = dm.get("BOARDID", "TQBR")
+        r2 = await client.get(
+            f"/engines/stock/markets/shares/boards/{boardid}/securities/{secid}.json",
+            params={
+                "iss.meta": "off",
+                "iss.only": "securities,marketdata",
+                "securities.columns": "SECID,SHORTNAME,LOTSIZE,CURRENCYID",
+                "marketdata.columns": "SECID,LAST,OPEN",
+            }
+        )
+        r2.raise_for_status()
+        q = r2.json()
+
+        sec_cols = q["securities"]["columns"]
+        sec_row  = next(iter(q["securities"]["data"]), None)
+        md_row   = next(iter(q["marketdata"]["data"]), None)
+
+        def sv(col):
+            idx = sec_cols.index(col) if col in sec_cols else -1
+            return sec_row[idx] if sec_row and idx >= 0 else None
+
+        shortname = sv("SHORTNAME") or dm.get("SHORTNAME") or secid
+        lot_size  = int(sv("LOTSIZE") or 1)
+        currency  = sv("CURRENCYID") or "RUB"
+        if currency == "SUR": currency = "RUB"
+        is_qual   = int(dm.get("ISQUALIFIEDINVESTORS") or 0)
+        price     = md_row[1] if md_row and md_row[1] else None
+        open_p    = md_row[2] if md_row else None
+
+    # Эмитент
+    # Если в stocks уже есть запись с emitent_id — сохраняем его, не пересоздаём
+    existing_stock = db.get_stock_by_secid(secid)
+    if existing_stock and existing_stock.get("emitent_id"):
+        emitent_id = existing_stock["emitent_id"]
+    else:
+        raw_name = dm.get("NAME") or dm.get("SHORTNAME") or shortname
+        emitent_name = re.sub(r'\s+(ПАО|ОАО|ЗАО|ООО|АО|НАО)\s+ао$', '', raw_name,
+                              flags=re.IGNORECASE).strip()
+        emitent_name = re.sub(r'\s+ао$', '', emitent_name, flags=re.IGNORECASE).strip()
+        emitent_name = re.sub(r'\s+(ПАО|ОАО|ЗАО|ООО|АО|НАО)$', '', emitent_name,
+                              flags=re.IGNORECASE).strip()
+        existing_emitent = db.get_emitent_by_name(emitent_name)
+        emitent_id = existing_emitent["id"] if existing_emitent else db.upsert_emitent(emitent_name)
+
+    return {
+        "secid":      secid,
+        "isin":       dm.get("ISIN", secid),
+        "emitent_id": emitent_id,
+        "shortname":  shortname,
+        "boardid":    boardid,
+        "price":      float(price) if price else None,
+        "open_price": float(open_p) if open_p else None,
+        "cost":       None,
+        "currency":   currency,
+        "is_qual":    is_qual,
+        "lot_size":   lot_size,
+    }
 
 
 # ── Курсы валют ────────────────────────────────────────────────────────────
 
-async def fetch_and_store_rates() -> dict:
-    """Запрашивает курсы валют с MOEX ISS и сохраняет в БД."""
-    today = dt_date.today().isoformat()
+async def fetch_and_store_rates() -> None:
     try:
-        async with httpx.AsyncClient(base_url="https://iss.moex.com/iss") as client:
-            r = await client.get(
-                "/statistics/engines/currency/markets/selt/rates.json?iss.meta=off",
-                timeout=10
-            )
+        async with _get_client() as client:
+            r = await client.get("/statistics/engines/currency/markets/selt/rates.json",
+                                 params={"iss.meta": "off"})
             r.raise_for_status()
             data = r.json()
 
-        cbrf_cols = data["cbrf"]["columns"]
-        cbrf_row  = data["cbrf"]["data"][0] if data["cbrf"]["data"] else []
-        cbrf      = dict(zip(cbrf_cols, cbrf_row))
+        usd = eur = cny = None
+        for block_name in ("cbrf", "wap_rates"):
+            block = data.get(block_name, {})
+            cols  = block.get("columns", [])
+            rows  = block.get("data", [])
+            for row in rows:
+                d = dict(zip(cols, row))
+                name = d.get("SHORTNAME", "") or d.get("SECID", "")
+                val  = d.get("RATE") or d.get("WAPRICE")
+                if not val:
+                    continue
+                if "USD" in name and not usd: usd = float(val)
+                if "EUR" in name and not eur: eur = float(val)
+                if "CNY" in name and not cny: cny = float(val)
 
-        usd = float(cbrf.get("CBRF_USD_LAST") or 0) or None
-        eur = float(cbrf.get("CBRF_EUR_LAST") or 0) or None
-
-        wap_cols  = data["wap_rates"]["columns"]
-        secid_idx = wap_cols.index("secid")
-        price_idx = wap_cols.index("price")
-        cny = None
-        for row in data["wap_rates"]["data"]:
-            if row[secid_idx] == "CNYRUB_TOM":
-                cny = float(row[price_idx])
-                break
-
-        if usd and eur and cny:
-            db.upsert_exchange_rates(today, usd, eur, cny)
-            logger.info("Курсы сохранены на %s: USD=%.4f EUR=%.4f CNY=%.4f", today, usd, eur, cny)
-            return {"usd": usd, "eur": eur, "cny": cny}
-        logger.warning("Не удалось получить все курсы: USD=%s EUR=%s CNY=%s", usd, eur, cny)
-        return {}
+        if usd or eur or cny:
+            today = dt_date.today().isoformat()
+            db.upsert_exchange_rates(today, usd or 0, eur or 0, cny or 0)
+            logger.info("Курсы обновлены: USD=%.2f EUR=%.2f CNY=%.4f", usd, eur, cny)
     except Exception as e:
         logger.error("Ошибка получения курсов: %s", e)
-        return {}
 
 
-def get_rates_for_calc() -> dict:
-    """Возвращает актуальные курсы для расчётов. Сначала сегодняшние, затем последние."""
-    today = dt_date.today().isoformat()
-    rates = db.get_exchange_rates(today) or db.get_latest_exchange_rates()
-    if rates:
-        return {"usd": rates["usd"], "eur": rates["eur"], "cny": rates["cny"]}
-    return {"usd": 90.0, "eur": 98.0, "cny": 12.0}  # фолбэк
+# ── Pydantic схемы ─────────────────────────────────────────────────────────
 
-
-# ── Получение данных с MOEX ISS ────────────────────────────────────────────
-
-async def _fetch_bond_data(secid: str) -> dict:
-    """
-    Делает 2 запроса к MOEX ISS и возвращает словарь для upsert_bond().
-    """
-    client = get_client()
-
-    # Запрос 2 — описание эмиссии
-    r2 = await client.get(f"/securities/{secid}.json?iss.meta=off")
-    r2.raise_for_status()
-    j2 = r2.json()
-
-    dm: dict = {}
-    for row in j2["description"]["data"]:
-        dm[row[0]] = row[2]
-
-    boards = j2.get("boards", {}).get("data", [])
-    board_cols = j2.get("boards", {}).get("columns", [])
-    is_primary_idx = board_cols.index("is_primary") if "is_primary" in board_cols else 14
-    boardid_idx    = board_cols.index("boardid")    if "boardid"    in board_cols else 1
-
-    board_row = next((r for r in boards if r[is_primary_idx] == 1), None)
-    boardid   = board_row[boardid_idx] if board_row else "TQCB"
-
-    # Определяем тип рынка по boardid
-    BOND_BOARDS  = {"TQCB", "TQOB", "TQOD", "TQOY", "TQIF", "EQOB", "EQIF"}
-    SHARE_BOARDS = {"TQBR", "TQBS", "TQDE", "TQNL", "TQNE", "EQBR", "EQBS"}
-    FUND_BOARDS  = {"TQTF", "TQTE", "EQTF"}
-
-    if boardid in SHARE_BOARDS:
-        market = "shares"
-    elif boardid in FUND_BOARDS:
-        market = "shares"  # фонды тоже на рынке shares
-    else:
-        market = "bonds"
-
-    # Запрос 3 — котировки
-    r3 = await client.get(
-        f"/engines/stock/markets/{market}/boards/{boardid}/securities/{secid}.json"
-        f"?iss.meta=off&iss.only=securities,marketdata"
-    )
-    r3.raise_for_status()
-    j3 = r3.json()
-
-    def to_dict(section: str) -> dict:
-        cols = j3[section]["columns"]
-        rows = j3[section]["data"]
-        return dict(zip(cols, rows[0])) if rows else {}
-
-    sec = to_dict("securities")
-    md  = to_dict("marketdata")
-
-    def g(d: dict, *keys, default=None):
-        for k in keys:
-            if d.get(k) not in (None, "", "0000-00-00"):
-                return d[k]
-        return default
-
-    price    = g(md, "LAST") or g(sec, "PREVPRICE")
-    face_val = float(dm.get("FACEVALUE") or 0)
-    nkd_num  = float(g(sec, "ACCRUEDINT") or 0)
-    currency = dm.get("FACEUNIT", "SUR")
-
-    # Получаем курсы для расчёта
-    rates = get_rates_for_calc()
-    fx = {"RUB": 1.0, "USD": rates["usd"], "EUR": rates["eur"], "CNY": rates["cny"]}
-    rate = fx.get(currency, 1.0)
-
-    # Для акций цена в рублях, не в % от номинала
-    if market == "shares":
-        cost = round(float(price) * rate, 2) if price else None
-    else:
-        bond_price_val = float(price) / 100 * face_val * rate if price else None
-        # НКД (ACCRUEDINT) всегда приходит в рублях с MOEX ISS
-        # Для рублёвых облигаций прибавляем напрямую
-        # Для валютных — body уже переведено в рубли через курс, НКД тоже в рублях → просто складываем
-        cost = round(bond_price_val + nkd_num, 2) if bond_price_val is not None else None
-
-    return {
-        "secid":               secid,
-        "isin":                dm.get("ISIN", secid),
-        "shortname":           dm.get("SHORTNAME"),
-        "name":                dm.get("NAME"),
-        "boardid":             boardid,
-        "price":               float(price) if price else None,
-        "face_value":          face_val or None,
-        "cost":                cost,
-        "yield_value":         float(g(md, "YIELD") or 0) or None,
-        "days_to_redemption":  int(dm["DAYSTOREDEMPTION"]) if dm.get("DAYSTOREDEMPTION") else None,
-        "is_amort":            1 if "Амортиз" in (dm.get("BOND_TYPE") or "") else 0,
-        "buyback_date":        g(sec, "BUYBACKDATE"),
-        "bond_subtype":        dm.get("BOND_SUBTYPE"),
-        "coupon_freq":         int(dm["COUPONFREQUENCY"]) if dm.get("COUPONFREQUENCY") else None,
-        "coupon_pct":          float(dm["COUPONPERCENT"]) if dm.get("COUPONPERCENT") else None,
-        "coupon_value":        float(dm["COUPONVALUE"]) if dm.get("COUPONVALUE") else None,
-        "nkd":                 nkd_num or None,
-        "currency":            "RUB" if currency == "SUR" else currency,
-        "is_qual":             1 if dm.get("ISQUALIFIEDINVESTORS") == "1" else 0,
-        "matdate":             dm.get("MATDATE"),
-        "open_price":          float(md.get("OPEN")) if md.get("OPEN") else None,
-        "list_level":          int(dm["LISTLEVEL"]) if dm.get("LISTLEVEL") else None,
-    }
+class AddItem(BaseModel):
+    secid:  str
+    broker: str | None = None
+    qty:    int = 0
 
 
 # ── Эндпоинты ──────────────────────────────────────────────────────────────
 
-@router.get("")
-async def list_portfolio():
-    """Возвращает весь портфель с данными из bonds."""
-    return JSONResponse(db.get_portfolio())
+@router.get("/portfolio")
+async def get_portfolio():
+    items = db.get_portfolio_with_instruments()
+    rates = _get_rates_for_calc()
+
+    for item in items:
+        if item["instrument_type"] == "bond":
+            item["cost"] = _calc_cost(
+                item.get("price"), item.get("face_value"),
+                item.get("nkd"), item.get("currency"),
+                item.get("qty", 1), rates
+            )
+        elif item["instrument_type"] in ("stock", "fund"):
+            price = item.get("price") or 0
+            qty   = item.get("qty", 1)
+            cur   = (item.get("currency") or "RUB").lower()
+            rate  = rates.get(cur, 1.0) if cur != "rub" else 1.0
+            item["cost"] = round(price * qty * rate, 2)
+
+    return JSONResponse(items)
 
 
-@router.post("", status_code=201)
-async def add_to_portfolio(item: PortfolioItem):
-    """
-    Добавляет бумагу в портфель.
-    Сразу синхронизирует данные с MOEX ISS.
-    """
+STALE_SECONDS = 30  # данные старше 30 сек считаем устаревшими
+
+
+def _is_stale(updated_at: str | None) -> bool:
+    """Проверяет устарели ли данные (более 30 секунд)."""
+    if not updated_at:
+        return True
+    from datetime import datetime, timezone
     try:
-        bond_data = await _fetch_bond_data(item.secid)
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(502, f"MOEX ISS вернул {e.response.status_code} для {item.secid}")
-    except Exception as e:
-        raise HTTPException(502, f"Ошибка запроса к MOEX ISS: {e}")
-
-    db.upsert_bond(bond_data)
-    db.upsert_portfolio(item.secid, item.broker, item.qty, item.rating, item.sector)
-    logger.info("Добавлена бумага в портфель: %s", item.secid)
-    return JSONResponse({"status": "ok", "secid": item.secid})
+        dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return (now - dt).total_seconds() > STALE_SECONDS
+    except Exception:
+        return True
 
 
-@router.put("/{secid}")
-async def update_portfolio_item(secid: str, data: PortfolioUpdate):
-    """Обновляет ручные поля: брокер, кол-во, рейтинг, сектор."""
-    if not db.get_bond(secid):
-        raise HTTPException(404, f"Бумага {secid} не найдена в базе")
-    db.upsert_portfolio(secid, data.broker, data.qty, data.rating, data.sector)
-    return JSONResponse({"status": "ok"})
+@router.post("/portfolio/add")
+async def add_to_portfolio(item: AddItem):
+    secid = item.secid.upper().strip()
 
+    # 1. Ищем в bonds
+    bond_data = db.get_bond_by_secid(secid)
+    if bond_data:
+        if _is_stale(bond_data.get("updated_at")):
+            try:
+                fresh = await _fetch_bond_data(secid)
+                db.upsert_bond(fresh)
+                bond_data = db.get_bond_by_secid(secid)
+            except Exception as e:
+                logger.warning("Не удалось обновить %s: %s", secid, e)
+        db.upsert_portfolio("bond", bond_data["id"], item.broker, item.qty)
+        logger.info("Добавлено в портфель: %s (bond)", secid)
+        return JSONResponse({"ok": True, "secid": secid, "type": "bond"})
 
-@router.delete("/{secid}")
-async def remove_from_portfolio(secid: str):
-    """Удаляет бумагу из портфеля."""
-    if not db.delete_portfolio_item(secid):
-        raise HTTPException(404, f"Бумага {secid} не найдена в портфеле")
-    logger.info("Удалена бумага из портфеля: %s", secid)
-    return JSONResponse({"status": "ok"})
+    # 2. Ищем в stocks
+    stock_data = db.get_stock_by_secid(secid)
+    if stock_data:
+        if _is_stale(stock_data.get("updated_at")):
+            try:
+                fresh = await _fetch_stock_data(secid)
+                db.upsert_stock(fresh)
+                stock_data = db.get_stock_by_secid(secid)
+            except Exception as e:
+                logger.warning("Не удалось обновить %s: %s", secid, e)
+        db.upsert_portfolio("stock", stock_data["id"], item.broker, item.qty)
+        logger.info("Добавлено в портфель: %s (stock)", secid)
+        return JSONResponse({"ok": True, "secid": secid, "type": "stock"})
 
+    # 3. Ищем в funds
+    fund_data = db.get_fund_by_secid(secid)
+    if fund_data:
+        if _is_stale(fund_data.get("updated_at")):
+            try:
+                fresh = await _fetch_stock_data(secid)  # фонды — та же логика
+                db.upsert_fund(fresh)
+                fund_data = db.get_fund_by_secid(secid)
+            except Exception as e:
+                logger.warning("Не удалось обновить %s: %s", secid, e)
+        db.upsert_portfolio("fund", fund_data["id"], item.broker, item.qty)
+        logger.info("Добавлено в портфель: %s (fund)", secid)
+        return JSONResponse({"ok": True, "secid": secid, "type": "fund"})
 
-@router.post("/{secid}/sync")
-async def sync_bond(secid: str):
-    """Обновляет данные одной бумаги с MOEX ISS."""
-    if not db.get_bond(secid):
-        raise HTTPException(404, f"Бумага {secid} не найдена в базе")
+    # 4. Нигде нет — идём на MOEX, определяем тип, создаём запись
     try:
-        bond_data = await _fetch_bond_data(secid)
+        async with _get_client() as client:
+            r = await client.get(f"/securities/{secid}.json",
+                                 params={"iss.meta": "off", "iss.only": "description"})
+            r.raise_for_status()
+            dm = {row[0]: row[2] for row in r.json()["description"]["data"]}
+        boardid = dm.get("BOARDID", "TQBR")
+        group   = dm.get("GROUP", "")
     except Exception as e:
-        raise HTTPException(502, f"Ошибка синхронизации {secid}: {e}")
-    db.upsert_bond(bond_data)
+        return JSONResponse({"error": f"Ошибка запроса к MOEX: {e}"}, status_code=502)
+
+    if "bond" in group.lower() or boardid in ("TQCB", "TQOB", "TQOD"):
+        try:
+            data = await _fetch_bond_data(secid)
+            instrument_id = db.upsert_bond(data)
+            instrument_type = "bond"
+        except Exception as e:
+            return JSONResponse({"error": f"Ошибка загрузки облигации: {e}"}, status_code=502)
+    elif "fund" in group.lower() or boardid in ("TQTF", "TQTE"):
+        try:
+            data = await _fetch_stock_data(secid)
+            instrument_id = db.upsert_fund(data)
+            instrument_type = "fund"
+        except Exception as e:
+            return JSONResponse({"error": f"Ошибка загрузки фонда: {e}"}, status_code=502)
+    else:
+        try:
+            data = await _fetch_stock_data(secid)
+            instrument_id = db.upsert_stock(data)
+            instrument_type = "stock"
+        except Exception as e:
+            return JSONResponse({"error": f"Ошибка загрузки акции: {e}"}, status_code=502)
+
+    db.upsert_portfolio(instrument_type, instrument_id, item.broker, item.qty)
+    logger.info("Добавлено в портфель: %s (%s)", secid, instrument_type)
+    return JSONResponse({"ok": True, "secid": secid, "type": instrument_type})
+
+
+@router.delete("/portfolio/{instrument_type}/{instrument_id}")
+async def remove_from_portfolio(instrument_type: str, instrument_id: int):
+    db.delete_portfolio_item(instrument_type, instrument_id)
+    return JSONResponse({"ok": True})
+
+
+@router.post("/portfolio/sync/{secid}")
+async def sync_one(secid: str):
+    """Обновляет данные одной бумаги с MOEX."""
+    secid = secid.upper()
+    bond  = db.get_bond_by_secid(secid)
+    stock = db.get_stock_by_secid(secid)
+
+    try:
+        if bond:
+            data = await _fetch_bond_data(secid)
+            db.upsert_bond(data)
+        elif stock:
+            data = await _fetch_stock_data(secid)
+            db.upsert_stock(data)
+        else:
+            return JSONResponse({"error": "Бумага не найдена"}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
     logger.info("Синхронизирована бумага: %s", secid)
-    return JSONResponse({"status": "ok", "secid": secid})
+    return JSONResponse({"ok": True, "secid": secid})
 
 
-@router.post("/sync-all")
+@router.post("/portfolio/sync-all")
 async def sync_all():
-    """Обновляет данные всех бумаг портфеля с MOEX ISS."""
-    portfolio = db.get_portfolio()
+    """Обновляет все бумаги портфеля с MOEX."""
+    items = db.get_portfolio_with_instruments()
     results = {"ok": [], "error": []}
-
-    for item in portfolio:
+    for item in items:
         secid = item["secid"]
         try:
-            bond_data = await _fetch_bond_data(secid)
-            db.upsert_bond(bond_data)
+            if item["instrument_type"] == "bond":
+                data = await _fetch_bond_data(secid)
+                db.upsert_bond(data)
+            elif item["instrument_type"] == "stock":
+                data = await _fetch_stock_data(secid)
+                db.upsert_stock(data)
             results["ok"].append(secid)
-            logger.info("Синхронизирована: %s", secid)
         except Exception as e:
-            results["error"].append({"secid": secid, "error": str(e)})
-            logger.error("Ошибка синхронизации %s: %s", secid, e)
+            logger.warning("Ошибка синхронизации %s: %s", secid, e)
+            results["error"].append(secid)
 
     return JSONResponse(results)
+
+
+@router.get("/rates")
+async def get_rates():
+    rates = db.get_latest_exchange_rates()
+    if not rates:
+        await fetch_and_store_rates()
+        rates = db.get_latest_exchange_rates()
+    return JSONResponse(rates or {})
