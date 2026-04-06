@@ -262,6 +262,60 @@ async def fetch_and_store_rates() -> None:
         logger.error("Ошибка получения курсов: %s", e)
 
 
+# ── Bondization (расписание купонов и амортизаций) ────────────────────────
+
+async def _fetch_and_save_bondization(secid: str) -> dict:
+    """Загружает расписание купонов и амортизаций с MOEX и сохраняет в БД.
+    Пропускает если расписание уже есть.
+    """
+    if db.has_bondization(secid):
+        return {"skipped": True}
+
+    async with _get_client() as client:
+        r = await client.get(
+            f"/securities/{secid}/bondization.json",
+            params={"iss.meta": "off", "iss.only": "coupons,amortizations"}
+        )
+        r.raise_for_status()
+        data = r.json()
+
+    # Парсим купоны
+    coup_cols = data["coupons"]["columns"]
+    coup_rows = data["coupons"]["data"]
+    ci = {col: i for i, col in enumerate(coup_cols)}
+
+    coupons = []
+    for row in coup_rows:
+        coupons.append({
+            "coupon_date": row[ci["coupondate"]],
+            "value":       row[ci["value"]],
+            "value_rub":   row[ci["value_rub"]],
+            "face_value":  row[ci["facevalue"]],
+        })
+
+    # Парсим амортизации
+    amort_cols = data["amortizations"]["columns"]
+    amort_rows = data["amortizations"]["data"]
+    ai = {col: i for i, col in enumerate(amort_cols)}
+
+    amorts = []
+    for row in amort_rows:
+        amorts.append({
+            "pay_date":    row[ai["amortdate"]],
+            "value":       row[ai["value"]],
+            "value_pct":   row[ai["valueprc"]],
+            "face_value":  row[ai["facevalue"]],
+            "data_source": row[ai["data_source"]],
+        })
+
+    c_inserted = db.save_bond_coupons(secid, coupons)
+    a_inserted = db.save_bond_amortizations(secid, amorts)
+
+    logger.info("Bondization %s: купонов=%d, амортизаций=%d",
+                secid, c_inserted, a_inserted)
+    return {"coupons": c_inserted, "amortizations": a_inserted}
+
+
 # ── Pydantic схемы ─────────────────────────────────────────────────────────
 
 class AddItem(BaseModel):
@@ -328,6 +382,10 @@ async def add_to_portfolio(item: AddItem):
                 logger.warning("Не удалось обновить %s: %s", secid, e)
         db.upsert_portfolio("bond", bond_data["id"], item.broker, item.qty)
         logger.info("Добавлено в портфель: %s (bond)", secid)
+        try:
+            await _fetch_and_save_bondization(secid)
+        except Exception as e:
+            logger.warning("Не удалось загрузить bondization для %s: %s", secid, e)
         return JSONResponse({"ok": True, "secid": secid, "type": "bond"})
 
     # 2. Ищем в stocks
@@ -394,6 +452,14 @@ async def add_to_portfolio(item: AddItem):
 
     db.upsert_portfolio(instrument_type, instrument_id, item.broker, item.qty)
     logger.info("Добавлено в портфель: %s (%s)", secid, instrument_type)
+
+    # Для облигаций загружаем расписание купонов и амортизаций
+    if instrument_type == "bond":
+        try:
+            await _fetch_and_save_bondization(secid)
+        except Exception as e:
+            logger.warning("Не удалось загрузить bondization для %s: %s", secid, e)
+
     return JSONResponse({"ok": True, "secid": secid, "type": instrument_type})
 
 
@@ -446,6 +512,53 @@ async def sync_all():
             results["error"].append(secid)
 
     return JSONResponse(results)
+
+
+@router.get("/yield-calendar")
+async def yield_calendar(months: int = 12):
+    """Возвращает будущие выплаты по облигациям портфеля по месяцам."""
+    if months < 1 or months > 120:
+        months = 12
+    data = db.get_yield_calendar(months=months)
+    # Считаем итоги
+    total_coupons = sum(
+        item["total_rub"] or 0
+        for month in data
+        for item in month["items"]
+        if item["pay_type"] == "coupon"
+    )
+    total_amort = sum(
+        item["total_rub"] or 0
+        for month in data
+        for item in month["items"]
+        if item["pay_type"] in ("amortization", "maturity")
+    )
+    return JSONResponse({
+        "months":         data,
+        "total_coupons":  round(total_coupons, 2),
+        "total_amort":    round(total_amort, 2),
+        "total":          round(total_coupons + total_amort, 2),
+        "period_months":  months,
+    })
+
+
+@router.post("/portfolio/bondization/{secid}")
+async def refresh_bondization(secid: str):
+    """Принудительно перезагружает расписание купонов и амортизаций."""
+    secid = secid.upper()
+    bond = db.get_bond_by_secid(secid)
+    if not bond:
+        return JSONResponse({"error": "Облигация не найдена"}, status_code=404)
+    try:
+        # Удаляем старые данные чтобы перезагрузить
+        with db._write_lock, db.get_conn() as conn:
+            conn.execute("DELETE FROM bond_coupons WHERE secid = ?", (secid,))
+            conn.execute("DELETE FROM bond_amortizations WHERE secid = ?", (secid,))
+            conn.commit()
+        result = await _fetch_and_save_bondization(secid)
+        return JSONResponse({"ok": True, **result})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
 
 
 @router.get("/rates")
