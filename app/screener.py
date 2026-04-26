@@ -120,7 +120,6 @@ async def _sync_task() -> None:
                 secname   = shortname or secid
 
                 # Определяем эмитента ТОЛЬКО для новых бумаг
-                # Для существующих берём emitent_id из screener_bonds (не пересоздаём)
                 emitent_id = None
                 if secid not in _existing_secids:
                     emitent_name = _extract_emitent_from_secname(secname, "bonds")
@@ -131,7 +130,6 @@ async def _sync_task() -> None:
                         else:
                             emitent_id = db.upsert_emitent(emitent_name)
                 else:
-                    # Берём существующий emitent_id из screener_bonds
                     with db.get_conn() as _conn:
                         _row = _conn.execute(
                             "SELECT emitent_id FROM screener_bonds WHERE secid = ?",
@@ -193,9 +191,8 @@ async def _sync_task() -> None:
 async def start_sync():
     if _sync_state["running"]:
         return JSONResponse({"error": "Синхронизация уже запущена"}, status_code=409)
-    # Запускаем напрямую (не в фоне) чтобы дождаться результата
-    await _sync_task()
-    return JSONResponse({"ok": True, "done": _sync_state["done"], "errors": _sync_state["errors"]})
+    asyncio.create_task(_sync_task())
+    return JSONResponse({"ok": True, "status": "started"})
 
 
 @router.get("/sync/status")
@@ -232,6 +229,7 @@ async def list_sectors():
 
 @router.get("/bonds")
 async def screener_bonds(
+    q:           Optional[str]   = None,   # поиск по ISIN / тикеру / названию
     yield_min:   Optional[float] = None,
     yield_max:   Optional[float] = None,
     years_min:   Optional[float] = None,
@@ -256,6 +254,7 @@ async def screener_bonds(
         })
 
     filters = {
+        "q":          q,
         "yield_min":  yield_min,
         "yield_max":  yield_max,
         "years_min":  years_min,

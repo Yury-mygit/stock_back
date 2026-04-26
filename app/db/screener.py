@@ -65,6 +65,14 @@ def query_screener_bonds(filters: dict, page: int = 1, page_size: int = 50) -> d
     conditions = ["sb.instrument_type = 'bond'"]
     params: list = []
 
+    # Текстовый поиск по ISIN, тикеру, названию
+    if filters.get("q"):
+        q = "%" + filters["q"].strip() + "%"
+        conditions.append(
+            "(sb.secid LIKE ? OR sb.isin LIKE ? OR sb.shortname LIKE ? OR sb.secname LIKE ?)"
+        )
+        params.extend([q, q, q, q])
+
     if filters.get("yield_min") is not None:
         conditions.append("sb.yield_value >= ?"); params.append(filters["yield_min"])
     if filters.get("yield_max") is not None:
@@ -130,7 +138,6 @@ def sync_screener_to_bonds() -> dict:
     Возвращает {inserted, updated}.
     """
     with _write_lock, get_conn() as conn:
-        # INSERT новых (которых ещё нет в bonds)
         conn.execute("""
             INSERT OR IGNORE INTO bonds (
                 secid, isin, emitent_id, shortname,
@@ -148,7 +155,6 @@ def sync_screener_to_bonds() -> dict:
         """)
         inserted = conn.execute("SELECT changes()").fetchone()[0]
 
-        # UPDATE существующих (не трогаем price, cost, nkd, yield_value — они из MOEX напрямую)
         conn.execute("""
             UPDATE bonds SET
                 isin         = (SELECT isin         FROM screener_bonds WHERE secid = bonds.secid),
@@ -172,13 +178,8 @@ def sync_screener_to_bonds() -> dict:
     return {"inserted": inserted, "updated": max(updated, 0)}
 
 
-
-
 def sync_screener_batch_to_bonds(rows: list[dict]) -> dict:
-    """После записи батча в screener_bonds — синхронизируем с bonds.
-    Если secid есть в bonds → обновляем только изменяемые поля.
-    Если нет → вставляем новую запись (без эмитента — emitent_id из screener_bonds).
-    """
+    """После записи батча в screener_bonds — синхронизируем с bonds."""
     now = datetime.now().isoformat(timespec="seconds")
     inserted = 0
     updated  = 0

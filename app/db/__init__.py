@@ -27,7 +27,6 @@ def init_db() -> None:
     create_tables()
 
 
-# Реэкспорт всех публичных функций для обратной совместимости
 from app.db.emitents import (
     upsert_emitent,
     get_emitent_by_name,
@@ -52,6 +51,7 @@ from app.db.portfolio import (
     upsert_portfolio,
     delete_portfolio_item,
     get_portfolio_with_instruments,
+    change_portfolio_qty,  
 )
 from app.db.ratings import (
     add_rating,
@@ -65,6 +65,9 @@ from app.db.bondization import (
     save_bond_coupons,
     save_bond_amortizations,
     get_yield_calendar,
+    get_portfolio_cashflow,
+    upsert_coupon_override,
+    get_coupon_override,
 )
 from app.db.exchange import (
     upsert_exchange_rates,
@@ -82,9 +85,12 @@ __all__ = [
     "upsert_screener_bonds_batch", "get_screener_bonds_count",
     "query_screener_bonds", "sync_screener_to_bonds", "sync_screener_batch_to_bonds",
     "upsert_portfolio", "delete_portfolio_item", "get_portfolio_with_instruments",
+    "change_portfolio_qty",
     "add_rating", "set_raexpert_url", "get_latest_rating",
     "get_rating_history", "get_all_emitents_for_ratings",
     "has_bondization", "save_bond_coupons", "save_bond_amortizations",
-    "get_yield_calendar",
+    "get_yield_calendar", "get_portfolio_cashflow",
+    "upsert_coupon_override",
+    "get_coupon_override",
     "upsert_exchange_rates", "get_exchange_rates", "get_latest_exchange_rates",
 ]

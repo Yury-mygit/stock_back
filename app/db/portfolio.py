@@ -89,3 +89,26 @@ def get_portfolio_with_instruments() -> list[dict]:
     for row in list(bonds) + list(stocks) + list(funds):
         result.append(dict(row))
     return result
+
+def change_portfolio_qty(instrument_type: str, instrument_id: int, delta: int) -> dict | None:
+    """Изменяет qty на delta. Возвращает новое состояние или None если не найдено."""
+    with _write_lock, get_conn() as conn:
+        row = conn.execute("""
+            SELECT id, qty FROM portfolio
+            WHERE instrument_type = ? AND instrument_id = ?
+        """, (instrument_type, instrument_id)).fetchone()
+
+        if not row:
+            return None
+
+        new_qty = row["qty"] + delta
+
+        if new_qty < 0:
+            return {"qty": new_qty}  # вернём отрицательное — контроллер отклонит
+
+        conn.execute("""
+            UPDATE portfolio SET qty = ?, updated_at = datetime('now')
+            WHERE id = ?
+        """, (new_qty, row["id"]))
+        conn.commit()
+        return {"qty": new_qty}

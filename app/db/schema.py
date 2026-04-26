@@ -181,5 +181,20 @@ def create_tables() -> None:
                 name       TEXT NOT NULL,
                 updated_at TEXT DEFAULT (datetime('now'))
             );
+
+            -- Пользовательские корректировки купонов.
+            -- Хранит фактические данные отдельно от плановых (MOEX).
+            -- Выживает при пересинхронизации bond_coupons.
+            CREATE TABLE IF NOT EXISTS coupon_overrides (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                secid        TEXT NOT NULL,
+                coupon_date  TEXT NOT NULL,   -- плановая дата = ключ связи
+                is_paid      INTEGER,         -- 1=подтверждён, 0=не получен
+                actual_date  TEXT,            -- фактическая дата (если перенесён)
+                actual_value REAL,            -- фактическая сумма (если скорректирована)
+                updated_at   TEXT DEFAULT (datetime('now')),
+                UNIQUE(secid, coupon_date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_coupon_overrides ON coupon_overrides(secid, coupon_date);
         """)
     logger.info("База данных инициализирована: %s", config.DB_PATH)
