@@ -10,6 +10,8 @@ from app import config, db
 from app.logger import logger
 from app.proxy import router as proxy_router, close_client
 from app.portfolio_api import router as portfolio_router, fetch_and_store_rates
+from app.screener import router as screener_router
+from app.ratings_api import router as ratings_router
 
 
 scheduler = AsyncIOScheduler()
@@ -58,20 +60,13 @@ app.add_middleware(
 
 app.include_router(proxy_router)
 app.include_router(portfolio_router)
+app.include_router(screener_router)
+app.include_router(ratings_router)
 
 
 @app.get("/health")
 async def health():
     return JSONResponse({"status": "ok", "moex_base": config.MOEX_BASE_URL, "db": str(config.DB_PATH)})
-
-
-@app.get("/rates")
-async def rates():
-    today = dt_date.today().isoformat()
-    data = db.get_exchange_rates(today) or db.get_latest_exchange_rates()
-    if not data:
-        return JSONResponse({"detail": "no rates available"}, status_code=503)
-    return JSONResponse(data)
 
 
 @app.get("/")

@@ -9,7 +9,8 @@ RUN pip install --no-cache-dir \
     "fastapi>=0.111.0" \
     "uvicorn[standard]>=0.30.0" \
     "httpx>=0.27.0" \
-    "apscheduler>=3.10,<4"
+    "apscheduler>=3.10,<4" \
+    beautifulsoup4
 
 COPY app/ ./app/
 COPY run.py ./
