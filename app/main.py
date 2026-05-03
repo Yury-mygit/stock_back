@@ -65,6 +65,15 @@ async def health():
     return JSONResponse({"status": "ok", "moex_base": config.MOEX_BASE_URL, "db": str(config.DB_PATH)})
 
 
+@app.get("/rates")
+async def rates():
+    today = dt_date.today().isoformat()
+    data = db.get_exchange_rates(today) or db.get_latest_exchange_rates()
+    if not data:
+        return JSONResponse({"detail": "no rates available"}, status_code=503)
+    return JSONResponse(data)
+
+
 @app.get("/")
 async def root():
     return JSONResponse({
