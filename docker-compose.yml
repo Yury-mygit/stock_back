@@ -1,0 +1,17 @@
+name: ${COMPOSE_PROJECT_NAME:?set COMPOSE_PROJECT_NAME in .env}
+
+services:
+  app:
+    build: .
+    container_name: ${CONTAINER_NAME:?set CONTAINER_NAME in .env}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${APP_PORT:?set APP_PORT in .env}:9011"
+    volumes:
+      - ./portfolio.db:/app/portfolio.db
+      - ./logs:/app/logs
+    environment:
+      - MOEX_PROXY_HOST=0.0.0.0
+      - MOEX_PROXY_PORT=9011
+      - MOEX_PROXY_CORS=
+      - MOEX_PROXY_LOG_LEVEL=INFO
